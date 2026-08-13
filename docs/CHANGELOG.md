@@ -5,6 +5,13 @@
 ## [Unreleased]
 
 ### Fixed
+- Windows 新增通用 `VPN_UDP_PEER` 数据报 transport，供外部 libopenconnect helper
+  通过 `openconnect_setup_tun_fd(HANDLE)` 接入，绕开上游 Windows CLI 不支持的
+  `--script-tun`；必需的随机 `VPN_UDP_TOKEN` 用于防止本机进程抢先注入握手。
+- Windows transport 直接使用 `net.UDPConn` 的跨平台 API，不再维护易错的 handle/fd
+  syscall 包装；Windows amd64 上可原生测试和构建。
+- netstack 或 proxy server 意外退出现在会传回 `main` 并产生非零进程退出码；不再只记
+  日志后继续运行半活进程。系统 DNS fallback 改用支持 context 取消的 `LookupNetIP`。
 - **大文件 SOCKS5 上传卡死/连接挂掉**（影响 ≥ ~10 MB 的文件上传场景）。根因是
   `net.FileConn` 会把 dup 出的 fd 强制设为 `O_NONBLOCK`，由于 dup 的 fd 共享同一
   file description，原 `*os.File` 也变成非阻塞，出向使用裸 `*os.File.Write` 在
@@ -22,20 +29,26 @@
   go-ocproxy 可以转发 IPv6 流量。SOCKS5 ATYP=0x04 (IPv6) 不再被拒绝，DNS 解析在
   A 记录无结果时回退到 AAAA 记录。IPv6 完全可选——不配置时行为不变。新增 `-ip6`
   CLI 参数和 `INTERNAL_IP6_DNS` 环境变量支持。
-- 启动时显式调大 VPN fd 的 `SO_SNDBUF` / `SO_RCVBUF` 至 1 MiB（macOS 默认 AF_UNIX
-  SOCK_DGRAM 仅约 8 KiB），降低 ENOBUFS 触发概率。
-- `stack/stack_test.go` 新增 7 个测试覆盖 `writeOutboundWithRetry` 的所有分支
+- 启动时通过 `net.UnixConn` / `net.UDPConn` portable setter 请求把 socket buffer 调到
+  1 MiB（macOS 默认 AF_UNIX SOCK_DGRAM 仅约 8 KiB），降低 ENOBUFS 触发概率。
+- `internal/netstack/netstack_darwin_test.go` 覆盖 `writeOutboundWithRetry` 的所有分支
   （W-RETRY-1..7）：成功、瞬时错误重试后成功、重试耗尽、致命错误立即退出、
   context 取消、SetDeadline 触发、`maxRetries=0` 边界。
 - `SPEC.md` 新增 S-OUT-5 / S-OUT-6 行为规格；S-OUT-2 / S-OUT-3 调整以反映
   退避重试 + 按秒聚合日志的新语义。
-- 新增 `CLAUDE.md`，给 AI 开发助手 / 长期维护者的项目背景、架构和坑位文档。
+- 新增 `AGENTS.md`，给 AI 开发助手 / 长期维护者的项目背景、架构和坑位文档。
 
 ### Changed
 - 出向 goroutine 不再使用裸 `*os.File.Write`，统一通过 `net.Conn.Write` 写 VPN fd。
 - input/output 不再各自 `net.FileConn` dup 一次，复用同一个 `vpnConn`；`SetDeadline`
   同时打断阻塞的 Read 和 Write。
 - 瞬时错误日志从"每包一行"改为"每秒至多一行"，减少抖动期日志噪音。
+- TCP 默认拥塞控制改用 gVisor CUBIC；入站包移除 `bytes.Clone` + `MakeWithData` 的双重
+  拷贝；源码按 `internal/transport`、`internal/netstack`、`internal/proxy` 划分。
+- gVisor `go` 分支从 `38fac1bddd3c` 升级到 `441f7aafaefa`，`x/net` 升级到
+  `v0.58.0`，`x/sys` 升级到 `v0.47.0`；构建环境改为始终跟随最新稳定版 Go（当前 1.26.5）。
+- GoReleaser 改为构建完整 package（而非仅 `main.go`），发布范围收敛为 macOS
+  arm64 / Windows amd64，并从 release tag 注入版本号。
 
 ### Internal
 - `outboundMaxRetries` / `outboundInitialDelay` / `outboundMaxDelay` 提为包级

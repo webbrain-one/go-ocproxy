@@ -1,4 +1,4 @@
-package socks
+package proxy
 
 import (
 	"bufio"
@@ -12,7 +12,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/awkj/go-ocproxy/stack"
+	"github.com/awkj/go-ocproxy/internal/netstack"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
@@ -282,11 +282,11 @@ func TestParseDNSResponseAAAA(t *testing.T) {
 	resp = binary.BigEndian.AppendUint16(resp, 28) // QTYPE=AAAA
 	resp = binary.BigEndian.AppendUint16(resp, 1)  // QCLASS=IN
 	// Answer: compressed name pointer
-	resp = append(resp, 0xC0, 0x0C)                  // name pointer
-	resp = binary.BigEndian.AppendUint16(resp, 28)   // TYPE=AAAA
-	resp = binary.BigEndian.AppendUint16(resp, 1)    // CLASS=IN
-	resp = binary.BigEndian.AppendUint32(resp, 600)  // TTL=600s
-	resp = binary.BigEndian.AppendUint16(resp, 16)   // RDLENGTH=16
+	resp = append(resp, 0xC0, 0x0C)                 // name pointer
+	resp = binary.BigEndian.AppendUint16(resp, 28)  // TYPE=AAAA
+	resp = binary.BigEndian.AppendUint16(resp, 1)   // CLASS=IN
+	resp = binary.BigEndian.AppendUint32(resp, 600) // TTL=600s
+	resp = binary.BigEndian.AppendUint16(resp, 16)  // RDLENGTH=16
 	// 2001:db8::1
 	resp = append(resp, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1)
 
@@ -344,9 +344,9 @@ func TestStats(t *testing.T) {
 
 func setupTestServer(t *testing.T) (*Server, string) {
 	t.Helper()
-	ns, err := stack.NewNetStack("10.0.0.1", 1500, "")
+	ns, err := netstack.New("10.0.0.1", 1500, "")
 	if err != nil {
-		t.Fatalf("NewNetStack: %v", err)
+		t.Fatalf("netstack.New: %v", err)
 	}
 	s := NewServer(ns, "127.0.0.1:0", nil, "")
 	if err := s.Listen(); err != nil {
@@ -464,55 +464,53 @@ func TestSOCKS5UnknownAddressType(t *testing.T) {
 	}
 }
 
-// SK-IP-1: resolve 不返回 IPv6 导致 panic
+// SK-IP-1: IPv4-only netstack selects an IPv4 result from the system resolver.
 func TestSOCKS5IPv4OnlyResolve(t *testing.T) {
-	_, addr := setupTestServer(t)
-	conn := dialTest(t, addr)
-	defer conn.Close()
-
-	conn.Write([]byte{0x05, 0x01, 0x00})
-	authResp := make([]byte, 2)
-	io.ReadFull(conn, authResp)
-
-	// CONNECT to "localhost" via domain — 不应 panic
-	domain := "localhost"
-	req := []byte{0x05, 0x01, 0x00, 0x03, byte(len(domain))}
-	req = append(req, domain...)
-	req = append(req, 0x00, 0x50)
-	conn.Write(req)
-
-	// 读响应（可能成功也可能失败，关键是不 panic）
-	resp := make([]byte, 10)
-	io.ReadFull(conn, resp)
-	t.Logf("reply for localhost: REP=0x%02x (no panic = pass)", resp[1])
+	ns, err := netstack.New("10.0.0.1", 1500, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ns.Close()
+	s := NewServer(ns, "127.0.0.1:0", nil, "")
+	ip, _, err := s.queryDNS(context.Background(), "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ip.To4() == nil {
+		t.Fatalf("expected IPv4 result, got %v", ip)
+	}
 }
 
-// SK-LIFE-1: 等两个方向都结束
+// SK-LIFE-1: copies both directions and cancellation unblocks both goroutines.
 func TestSOCKS5BidirectionalCopy(t *testing.T) {
-	s, addr := setupTestServer(t)
+	client, clientPeer := net.Pipe()
+	tunnel, tunnelPeer := net.Pipe()
+	defer clientPeer.Close()
+	defer tunnelPeer.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan [2]int64, 1)
+	go func() {
+		in, out := bidirectionalCopy(ctx, client, tunnel)
+		done <- [2]int64{in, out}
+	}()
 
-	conn := dialTest(t, addr)
-	defer conn.Close()
-
-	conn.Write([]byte{0x05, 0x01, 0x00})
-	authResp := make([]byte, 2)
-	io.ReadFull(conn, authResp)
-
-	// CONNECT to 10.0.0.1:1 (will fail — gVisor 内部没有监听)
-	conn.Write([]byte{
-		0x05, 0x01, 0x00, 0x01,
-		10, 0, 0, 1,
-		0x00, 0x01,
-	})
-
-	resp := make([]byte, 10)
-	io.ReadFull(conn, resp)
-	// 连接可能失败（REP != 0x00），但不应 panic
-	t.Logf("connect reply: REP=0x%02x", resp[1])
-
-	// 验证统计计数器递增
-	if s.Stats.TotalConns.Load() < 1 {
-		t.Error("TotalConns should be ≥ 1")
+	go clientPeer.Write([]byte("abc"))
+	buf := make([]byte, 3)
+	if _, err := io.ReadFull(tunnelPeer, buf); err != nil || string(buf) != "abc" {
+		t.Fatalf("client to tunnel: %q, %v", buf, err)
+	}
+	go tunnelPeer.Write([]byte("xyz"))
+	if _, err := io.ReadFull(clientPeer, buf); err != nil || string(buf) != "xyz" {
+		t.Fatalf("tunnel to client: %q, %v", buf, err)
+	}
+	cancel()
+	select {
+	case counts := <-done:
+		if counts != [2]int64{3, 3} {
+			t.Fatalf("unexpected byte counts: %v", counts)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("copy did not stop after cancellation")
 	}
 }
 
@@ -566,9 +564,9 @@ func TestSOCKS5ConnectionLimit(t *testing.T) {
 // ===========================================================================
 
 func TestResolveCacheHit(t *testing.T) {
-	ns, err := stack.NewNetStack("10.0.0.1", 1500, "")
+	ns, err := netstack.New("10.0.0.1", 1500, "")
 	if err != nil {
-		t.Fatalf("NewNetStack: %v", err)
+		t.Fatalf("netstack.New: %v", err)
 	}
 	s := NewServer(ns, "127.0.0.1:0", nil, "")
 	// 预填 cache
@@ -587,9 +585,9 @@ func TestResolveCacheHit(t *testing.T) {
 }
 
 func TestResolveCacheMiss(t *testing.T) {
-	ns, err := stack.NewNetStack("10.0.0.1", 1500, "")
+	ns, err := netstack.New("10.0.0.1", 1500, "")
 	if err != nil {
-		t.Fatalf("NewNetStack: %v", err)
+		t.Fatalf("netstack.New: %v", err)
 	}
 	s := NewServer(ns, "127.0.0.1:0", nil, "")
 
@@ -607,9 +605,9 @@ func TestResolveCacheMiss(t *testing.T) {
 // ===========================================================================
 
 func TestDumpStats(t *testing.T) {
-	ns, err := stack.NewNetStack("10.0.0.1", 1500, "")
+	ns, err := netstack.New("10.0.0.1", 1500, "")
 	if err != nil {
-		t.Fatalf("NewNetStack: %v", err)
+		t.Fatalf("netstack.New: %v", err)
 	}
 	s := NewServer(ns, "127.0.0.1:0", nil, "")
 	s.Stats.connOpened()

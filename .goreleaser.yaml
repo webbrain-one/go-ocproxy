@@ -3,36 +3,40 @@ version: 2
 project_name: go-ocproxy
 
 archives:
-  - format: xz
+  - id: macos
+    ids:
+      - macos-arm64
+    formats:
+      - tar.gz
+    files:
+      - none*
+  - id: windows
+    ids:
+      - windows-amd64
+    formats:
+      - zip
     files:
       - none*
 builds:
-  - id: goreleaser-multi-arch-docker
-    main: ./main.go
+  - id: macos-arm64
+    main: .
     goos:
-      - android
-      - freebsd
-      - linux
       - darwin
     goarch:
-      - amd64
-      - 386
-      - arm
       - arm64
-    ignore:
-      - goos: freebsd
-        goarch: arm
-      - goos: darwin
-        goarch: 386
-      - goos: darwin
-        goarch: arm
-      # Because they need CGO_ENABLED=1. https://github.com/cli/gh-extension-precompile/issues/50
-      - goos: android
-        goarch: amd64
-      - goos: android
-        goarch: 386
-      - goos: android
-        goarch: arm
     env:
       - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+  - id: windows-amd64
+    main: .
+    goos:
+      - windows
+    goarch:
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
     mod_timestamp: "{{ .CommitTimestamp }}"

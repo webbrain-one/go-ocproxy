@@ -8,19 +8,29 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/awkj/go-ocproxy/socks"
-	"github.com/awkj/go-ocproxy/stack"
+	"github.com/awkj/go-ocproxy/internal/netstack"
+	"github.com/awkj/go-ocproxy/internal/proxy"
+	"github.com/awkj/go-ocproxy/internal/transport"
 )
 
-const Version = "1.1.0 (Go-gVisor rewrite)"
+// version is optionally injected from a release tag or source commit through
+// -ldflags. Local builds fall back to Go's embedded VCS metadata.
+var version string
 
 func main() {
+	if err := run(); err != nil {
+		log.Printf("[main] fatal: %v", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	socksPort := flag.String("D", "1080", "Listen port for SOCKS5/HTTP proxy (auto-sniffed)")
 	showVersion := flag.Bool("V", false, "Show version")
 	localIP := flag.String("ip", "", "Internal IPv4 address")
@@ -29,23 +39,27 @@ func main() {
 	dnsDomain := flag.String("o", "", "Default DNS domain suffix (CISCO_DEF_DOMAIN)")
 	keepalive := flag.Int("k", 0, "TCP keepalive interval in seconds (0=disabled)")
 	flag.Parse()
+	buildVersion := resolvedVersion()
 
 	if *showVersion {
-		fmt.Printf("go-ocproxy version: %s\n", Version)
-		return
+		fmt.Printf("go-ocproxy version: %s\n", buildVersion)
+		return nil
 	}
 
 	*localIP = cmp.Or(*localIP, os.Getenv("INTERNAL_IP4_ADDRESS"))
 	if *localIP == "" {
-		log.Fatal("[main] Internal IP address not set. Use -ip or run via openconnect.")
+		return errors.New("internal IP address not set; use -ip or run via OpenConnect")
 	}
 
 	*localIP6 = cmp.Or(*localIP6, os.Getenv("INTERNAL_IP6_ADDRESS"))
 
-	if envMTU := os.Getenv("INTERNAL_IP4_MTU"); envMTU != "" {
-		if m, err := strconv.Atoi(envMTU); err == nil {
-			*mtu = m
-		}
+	validatedMTU, err := mtuFromEnv(*mtu, os.Getenv("INTERNAL_IP4_MTU"))
+	if err != nil {
+		return err
+	}
+	*mtu = int(validatedMTU)
+	if *localIP6 != "" && *mtu < 1280 {
+		return fmt.Errorf("MTU must be at least 1280 when IPv6 is enabled: %d", *mtu)
 	}
 
 	var dnsServers []string
@@ -61,7 +75,7 @@ func main() {
 	listenAddr := "127.0.0.1:" + *socksPort
 
 	log.Printf("[main] -----------------------------------------")
-	log.Printf("[main]   go-ocproxy %s", Version)
+	log.Printf("[main]   go-ocproxy %s", buildVersion)
 	log.Printf("[main] -----------------------------------------")
 	log.Printf("[main] Listening:     %s (SOCKS5/HTTP)", listenAddr)
 	log.Printf("[main] Internal IP:   %s", *localIP)
@@ -77,86 +91,125 @@ func main() {
 		log.Printf("[main] TCP Keepalive: %ds", *keepalive)
 	}
 
-	ns, err := stack.NewNetStack(*localIP, uint32(*mtu), *localIP6)
+	ns, err := netstack.New(*localIP, uint32(*mtu), *localIP6)
 	if err != nil {
-		log.Fatalf("[main] Failed to initialize netstack: %v", err)
+		return fmt.Errorf("initialize netstack: %w", err)
 	}
+	defer ns.Close()
 	if *keepalive > 0 {
 		ns.TCPKeepalive = time.Duration(*keepalive) * time.Second
 	}
 
-	server := socks.NewServer(ns, listenAddr, dnsServers, *dnsDomain)
+	server := proxy.NewServer(ns, listenAddr, dnsServers, *dnsDomain)
 	if err := server.Listen(); err != nil {
-		log.Fatalf("[main] SOCKS5 listen failed: %v", err)
+		return fmt.Errorf("listen on %s: %w", listenAddr, err)
 	}
 
-	// signal.NotifyContext 把 SIGINT/SIGTERM/SIGHUP 直接挂到 ctx 上：信号一来
-	// ctx 自动 cancel，传到 ns.Run / server.Serve 内的 select case <-ctx.Done()。
-	// 比手写 signal.Notify + goroutine + select 少一坨 boilerplate。
-	// SIGUSR1 不是 shutdown 而是 dump stats，仍然单独处理。
-	ctx, ctxCancel := signal.NotifyContext(context.Background(),
-		syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	ctx, ctxCancel := newSignalContext(context.Background(), server.DumpStats)
 	defer ctxCancel()
 
-	statsCh := make(chan os.Signal, 1)
-	signal.Notify(statsCh, syscall.SIGUSR1)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-statsCh:
-				server.DumpStats()
+	tunnel, err := transport.OpenFromEnv()
+	if err != nil {
+		ctxCancel()
+		server.Close(5 * time.Second)
+		return fmt.Errorf("open VPN transport: %w", err)
+	}
+	defer tunnel.Close()
+
+	serveErrCh := make(chan error, 1)
+	go func() { serveErrCh <- server.Serve(ctx) }()
+	netstackErrCh := make(chan error, 1)
+	go func() { netstackErrCh <- ns.Run(ctx, tunnel) }()
+
+	var componentErr error
+	netstackDone := false
+	select {
+	case err := <-netstackErrCh:
+		netstackDone = true
+		if !isCleanShutdownErr(err) {
+			componentErr = fmt.Errorf("netstack: %w", err)
+		}
+		log.Printf("[main] netstack exited, shutting down...")
+	case err := <-serveErrCh:
+		if err != nil {
+			componentErr = fmt.Errorf("proxy server: %w", err)
+		} else if ctx.Err() == nil {
+			componentErr = errors.New("proxy server stopped unexpectedly")
+		}
+		log.Printf("[main] proxy server exited, shutting down...")
+	}
+	ctxCancel()
+	tunnel.Close()
+	server.Close(5 * time.Second)
+	if !netstackDone {
+		select {
+		case <-netstackErrCh:
+		case <-time.After(2 * time.Second):
+			if componentErr == nil {
+				componentErr = errors.New("netstack did not stop after tunnel close")
 			}
 		}
-	}()
-
-	go func() {
-		if err := server.Serve(ctx); err != nil {
-			log.Printf("[socks] serve error: %v", err)
-		}
-	}()
-
-	var vpnFile *os.File
-	if vpnfdStr := os.Getenv("VPNFD"); vpnfdStr != "" {
-		fd, err := strconv.Atoi(vpnfdStr)
-		if err != nil {
-			log.Fatalf("[main] Invalid VPNFD value %q: %v", vpnfdStr, err)
-		}
-		vpnFile = os.NewFile(uintptr(fd), "vpnfd")
-		if vpnFile == nil {
-			log.Fatalf("[main] Failed to open VPNFD=%d", fd)
-		}
-		defer vpnFile.Close()
-		log.Printf("[main] Using VPNFD=%d for tunnel I/O", fd)
-	} else {
-		log.Printf("[main] VPNFD not set, falling back to stdin/stdout")
-	}
-
-	var input, output *os.File
-	if vpnFile != nil {
-		input = vpnFile
-		output = vpnFile
-	} else {
-		input = os.Stdin
-		output = os.Stdout
-	}
-
-	runErr := ns.Run(ctx, input, output)
-	log.Printf("[main] netstack exited, shutting down...")
-	ctxCancel()
-	server.Close(5 * time.Second)
-	if runErr != nil && !isCleanShutdownErr(runErr) {
-		log.Printf("[main] netstack error: %v", runErr)
 	}
 	log.Printf("[main] shutdown complete")
+	return componentErr
+}
+
+func mtuFromEnv(fallback int, value string) (uint32, error) {
+	mtu := fallback
+	if value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			return 0, fmt.Errorf("invalid INTERNAL_IP4_MTU %q: %w", value, err)
+		}
+		mtu = parsed
+	}
+	if mtu < 576 || mtu > 65535 {
+		return 0, fmt.Errorf("MTU must be between 576 and 65535: %d", mtu)
+	}
+	return uint32(mtu), nil
+}
+
+func resolvedVersion() string {
+	if version != "" {
+		return version
+	}
+
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "devel"
+	}
+	if info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+
+	var revision string
+	modified := false
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value == "true"
+		}
+	}
+	if revision == "" {
+		return "devel"
+	}
+	if len(revision) > 12 {
+		revision = revision[:12]
+	}
+	if modified {
+		revision += "-dirty"
+	}
+	return revision
 }
 
 func isCleanShutdownErr(err error) bool {
 	if err == nil {
 		return true
 	}
-	if errors.Is(err, os.ErrClosed) || errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, syscall.EBADF) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, os.ErrClosed) ||
+		errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, syscall.EBADF) {
 		return true
 	}
 	msg := err.Error()

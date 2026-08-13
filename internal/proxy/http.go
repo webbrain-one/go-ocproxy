@@ -1,4 +1,4 @@
-package socks
+package proxy
 
 import (
 	"bufio"
@@ -58,7 +58,7 @@ func writeHTTPStatus(conn net.Conn, status string) {
 	fmt.Fprintf(conn, "HTTP/1.1 %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", status)
 }
 
-func (s *Server) handleHTTP(conn net.Conn, br *bufio.Reader) {
+func (s *Server) handleHTTP(ctx context.Context, conn net.Conn, br *bufio.Reader) {
 	start := time.Now()
 	remote := conn.RemoteAddr().String()
 
@@ -70,13 +70,13 @@ func (s *Server) handleHTTP(conn net.Conn, br *bufio.Reader) {
 	}
 
 	if req.Method == http.MethodConnect {
-		s.handleConnect(conn, req, start, remote)
+		s.handleConnect(ctx, conn, req, start, remote)
 		return
 	}
-	s.handleHTTPForward(conn, req, start, remote)
+	s.handleHTTPForward(ctx, conn, req, start, remote)
 }
 
-func (s *Server) handleConnect(conn net.Conn, req *http.Request, start time.Time, remote string) {
+func (s *Server) handleConnect(ctx context.Context, conn net.Conn, req *http.Request, start time.Time, remote string) {
 	host, port, err := splitHostPortDefault(req.Host, "443")
 	if err != nil {
 		log.Printf("[http] %s bad CONNECT host %q: %v", remote, req.Host, err)
@@ -86,7 +86,7 @@ func (s *Server) handleConnect(conn net.Conn, req *http.Request, start time.Time
 
 	log.Printf("[http] %s CONNECT %s:%d", remote, host, port)
 
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), socksDialTimeout)
+	dialCtx, dialCancel := context.WithTimeout(ctx, socksDialTimeout)
 	tunnel, err := s.resolveAndDial(dialCtx, host, port)
 	dialCancel()
 	if err != nil {
@@ -102,7 +102,7 @@ func (s *Server) handleConnect(conn net.Conn, req *http.Request, start time.Time
 	}
 	conn.SetDeadline(time.Time{})
 
-	bytesIn, bytesOut := bidirectionalCopy(conn, tunnel)
+	bytesIn, bytesOut := bidirectionalCopy(ctx, conn, tunnel)
 	s.Stats.BytesIn.Add(bytesIn)
 	s.Stats.BytesOut.Add(bytesOut)
 
@@ -110,21 +110,25 @@ func (s *Server) handleConnect(conn net.Conn, req *http.Request, start time.Time
 	log.Printf("[http] %s CONNECT %s:%d closed, duration=%s in=%d out=%d", remote, host, port, dur, bytesIn, bytesOut)
 }
 
-func (s *Server) handleHTTPForward(conn net.Conn, req *http.Request, start time.Time, remote string) {
+func (s *Server) handleHTTPForward(ctx context.Context, conn net.Conn, req *http.Request, start time.Time, remote string) {
 	if req.URL == nil || req.URL.Host == "" {
 		log.Printf("[http] %s non-proxy request: %s %s", remote, req.Method, req.RequestURI)
 		writeHTTPStatus(conn, "400 Bad Request")
 		return
 	}
 
-	host, port, err := splitHostPortDefault(req.URL.Host, "80")
+	defaultPort := "80"
+	if strings.EqualFold(req.URL.Scheme, "https") {
+		defaultPort = "443"
+	}
+	host, port, err := splitHostPortDefault(req.URL.Host, defaultPort)
 	if err != nil {
 		log.Printf("[http] %s bad target %q: %v", remote, req.URL.Host, err)
 		writeHTTPStatus(conn, "400 Bad Request")
 		return
 	}
 
-	dialCtx, dialCancel := context.WithTimeout(context.Background(), socksDialTimeout)
+	dialCtx, dialCancel := context.WithTimeout(ctx, socksDialTimeout)
 	upstream, err := s.resolveAndDial(dialCtx, host, port)
 	dialCancel()
 	if err != nil {
