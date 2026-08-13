@@ -1,3 +1,5 @@
+
+
 # go-ocproxy
 
 English | [简体中文](README_zh.md)
@@ -47,6 +49,7 @@ The listening port accepts both SOCKS5 and HTTP proxy connections. In your brows
 | :--- | :--- | :--- |
 | `-D` | SOCKS5/HTTP proxy listen port (same port, auto-sniffed) | `1080` |
 | `-ip` | Manually specify internal IPv4 address (usually auto-detected) | None |
+| `-ip6` | Manually specify internal IPv6 address (usually auto-detected) | None |
 | `-mtu` | Manually specify MTU (usually auto-detected) | `1500` |
 | `-o` | Default DNS domain suffix (overrides `CISCO_DEF_DOMAIN`) | None |
 | `-k` | TCP keepalive interval in seconds (0 to disable) | `0` |
