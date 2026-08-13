@@ -28,7 +28,7 @@ OpenConnect transport
   └─ Windows: VPN_UDP_PEER / connected loopback UDP
                          │
                          ▼
-                 internal/netstack/netstack.go
+                 netstack/netstack.go
                  ├─ inbound  : VPN → gVisor
                  └─ outbound : gVisor → VPN
                          │
@@ -36,14 +36,14 @@ OpenConnect transport
                  gVisor netstack
                          │
                          ▼
-                 internal/proxy/socks5.go + http.go + dns.go
+                 proxy/socks5.go + http.go + dns.go
                  SOCKS5 / HTTP :1080 ← browser / curl
 ```
 
-- **入口**：`main.go` 解析 flag/env，创建 `NetStack`（支持可选 IPv6 双栈），跑 `socks.Server` + `ns.Run()`
-- **internal/transport/**：平台 transport 适配；macOS 读取 `VPNFD`，Windows 建立 loopback UDP
-- **internal/netstack/**：gVisor 集成（IPv4 + 可选 IPv6），负责 IP 包搬运和平台健康检查
-- **internal/proxy/**：`server.go` 管生命周期，`socks5.go` / `http.go` 管协议，`dns.go` 管 DNS（A + 可选 AAAA 回退，含 DNS-over-TCP 走隧道）
+- **入口**：`main.go` 解析 flag/env，创建 `NetStack`（支持可选 IPv6 双栈），跑 `proxy.Server` + `ns.Run()`
+- **transport/**：平台 transport 适配；macOS 读取 `VPNFD`，Windows 建立 loopback UDP
+- **netstack/**：gVisor 集成（IPv4 + 可选 IPv6），负责 IP 包搬运和平台健康检查
+- **proxy/**：`server.go` 管生命周期，`socks5.go` / `http.go` 管协议，`dns.go` 管 DNS（A + 可选 AAAA 回退，含 DNS-over-TCP 走隧道）
 
 ## 支持平台与边界
 
@@ -70,7 +70,7 @@ gVisor 的 `*PacketBuffer` 用引用计数管理。`channel.Endpoint.ReadContext
 
 ### 3. Transport 必须是单一双向 `net.Conn`
 
-macOS 只在 `internal/transport` 中把 `VPNFD` 转换一次为 `net.Conn`，随后关闭继承的原 fd；Windows 直接使用 connected `*net.UDPConn`。`NetStack.Run` 只接收一个双向 `net.Conn`，不能重新引入 input/output 两套句柄或裸 `*os.File.Write`。否则 `net.FileConn` 的 dup/O_NONBLOCK 语义会造成 EAGAIN 丢包，并让读写实际落在不同对象上。
+macOS 只在 `transport` 中把 `VPNFD` 转换一次为 `net.Conn`，随后关闭继承的原 fd；Windows 直接使用 connected `*net.UDPConn`。`NetStack.Run` 只接收一个双向 `net.Conn`，不能重新引入 input/output 两套句柄或裸 `*os.File.Write`。否则 `net.FileConn` 的 dup/O_NONBLOCK 语义会造成 EAGAIN 丢包，并让读写实际落在不同对象上。
 
 ### 4. macOS ENOBUFS 不能当 fatal
 
@@ -80,7 +80,7 @@ macOS 上 AF_UNIX SOCK_DGRAM 在高吞吐时会因系统 mbuf 池**暂时耗尽*
 - ❌ 当 transient 静默丢包 → TCP 触发重传，重传又遇 ENOBUFS，连接事实停滞
 - ✅ 用 `writeOutboundWithRetry` 退避重试（1ms→32ms 上限，最多 10 次），实在不行才丢一个包但**绝不退出 goroutine**
 
-详见 `internal/netstack/netstack.go` 的 `writeOutboundWithRetry`。
+详见 `netstack/netstack.go` 的 `writeOutboundWithRetry`。
 
 ### 5. macOS AF_UNIX 默认 SO_SNDBUF 极小
 
@@ -94,7 +94,7 @@ AF_UNIX SOCK_DGRAM 没有 TCP 那种 EOF 概念——对端 `close()` 后，本�
 
 ### 7. SOCKS5 收到域名时的 DNS 解析
 
-`--script-tun` 模式下，UDP DNS 偶发丢包。go-ocproxy 在 SOCKS5 收到域名请求时优先查询 UDP，响应截断或失败时通过 gVisor 隧道回退 DNS-over-TCP。详见 `internal/proxy/dns.go`。
+`--script-tun` 模式下，UDP DNS 偶发丢包。go-ocproxy 在 SOCKS5 收到域名请求时优先查询 UDP，响应截断或失败时通过 gVisor 隧道回退 DNS-over-TCP。详见 `proxy/dns.go`。
 
 ### 8. channel.Endpoint 队列大小 ≥ 1024
 
@@ -128,7 +128,7 @@ writeOutboundWithRetry(ctx, vpnConn, data)
                                   └─ 全部失败        → 返回 transient err（调用方丢包但**不退出**，按秒聚合日志）
 ```
 
-测试约定：每条分支至少一个 unit test（见 `internal/netstack/netstack_darwin_test.go` 的 `TestWriteOutboundWithRetry_*`）。
+测试约定：每条分支至少一个 unit test（见 `netstack/netstack_darwin_test.go` 的 `TestWriteOutboundWithRetry_*`）。
 
 ## 调试
 
@@ -143,7 +143,7 @@ writeOutboundWithRetry(ctx, vpnConn, data)
 
 ```bash
 go test ./...           # 单元 + 集成
-go test ./internal/netstack/ -v  # 看每个 case
+go test ./netstack/ -v  # 看每个 case
 go test ./... -race     # 数据竞争检测
 ```
 

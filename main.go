@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/awkj/go-ocproxy/internal/netstack"
-	"github.com/awkj/go-ocproxy/internal/proxy"
-	"github.com/awkj/go-ocproxy/internal/transport"
+	"github.com/awkj/go-ocproxy/netstack"
+	"github.com/awkj/go-ocproxy/proxy"
+	"github.com/awkj/go-ocproxy/transport"
 )
 
 // version is optionally injected from a release tag or source commit through

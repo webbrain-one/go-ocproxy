@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/awkj/go-ocproxy/internal/netstack"
+	"github.com/awkj/go-ocproxy/netstack"
 )
 
 // ---------------------------------------------------------------------------

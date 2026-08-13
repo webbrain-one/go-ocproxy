@@ -31,7 +31,7 @@
   CLI 参数和 `INTERNAL_IP6_DNS` 环境变量支持。
 - 启动时通过 `net.UnixConn` / `net.UDPConn` portable setter 请求把 socket buffer 调到
   1 MiB（macOS 默认 AF_UNIX SOCK_DGRAM 仅约 8 KiB），降低 ENOBUFS 触发概率。
-- `internal/netstack/netstack_darwin_test.go` 覆盖 `writeOutboundWithRetry` 的所有分支
+- `netstack/netstack_darwin_test.go` 覆盖 `writeOutboundWithRetry` 的所有分支
   （W-RETRY-1..7）：成功、瞬时错误重试后成功、重试耗尽、致命错误立即退出、
   context 取消、SetDeadline 触发、`maxRetries=0` 边界。
 - `SPEC.md` 新增 S-OUT-5 / S-OUT-6 行为规格；S-OUT-2 / S-OUT-3 调整以反映
@@ -44,7 +44,7 @@
   同时打断阻塞的 Read 和 Write。
 - 瞬时错误日志从"每包一行"改为"每秒至多一行"，减少抖动期日志噪音。
 - TCP 默认拥塞控制改用 gVisor CUBIC；入站包移除 `bytes.Clone` + `MakeWithData` 的双重
-  拷贝；源码按 `internal/transport`、`internal/netstack`、`internal/proxy` 划分。
+  拷贝；源码按 `transport`、`netstack`、`proxy` 划分。
 - gVisor `go` 分支从 `38fac1bddd3c` 升级到 `441f7aafaefa`，`x/net` 升级到
   `v0.58.0`，`x/sys` 升级到 `v0.47.0`；构建环境改为始终跟随最新稳定版 Go（当前 1.26.5）。
 - GoReleaser 改为构建完整 package（而非仅 `main.go`），发布范围收敛为 macOS

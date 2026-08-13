@@ -12,7 +12,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/awkj/go-ocproxy/internal/netstack"
+	"github.com/awkj/go-ocproxy/netstack"
 	"golang.org/x/net/dns/dnsmessage"
 )
 

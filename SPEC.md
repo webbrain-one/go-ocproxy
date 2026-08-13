@@ -5,7 +5,7 @@
 
 ---
 
-## 1. netstack — 网络栈 I/O（`internal/netstack/netstack.go`）
+## 1. netstack — 网络栈 I/O（`netstack/netstack.go`）
 
 ### 1.1 Inbound：VPN → gVisor
 
@@ -68,7 +68,7 @@
 
 ---
 
-## 2. proxy — SOCKS5 + HTTP 代理服务器（`internal/proxy/socks5.go`、`internal/proxy/http.go`）
+## 2. proxy — SOCKS5 + HTTP 代理服务器（`proxy/socks5.go`、`proxy/http.go`）
 
 监听端口同时承载 SOCKS5 和 HTTP 代理，靠首字节嗅探分流（见 SK-SNIFF-1）。
 
@@ -118,7 +118,7 @@
 | SK-STATS-1 | 维护以下计数器：活跃连接数、历史最大连接数、总连接数、总传输字节数（in/out）、DNS cache 命中数 / 未命中数。 | [TESTABLE] 建立并关闭若干连接后，检查计数器值 |
 | SK-STATS-2 | 收到 SIGUSR1 信号时，输出当前统计到日志。格式至少包含：`"connections: active=%d max=%d total=%d dns_cache_hit=%d miss=%d"` | [TESTABLE] 发送 SIGUSR1，检查 log 输出 |
 
-### 2.7 HTTP 代理协议（`internal/proxy/http.go`）
+### 2.7 HTTP 代理协议（`proxy/http.go`）
 
 HTTP handler 复用 SOCKS 的连接生命周期、连接数限制、DNS 解析与统计逻辑。
 
@@ -137,7 +137,7 @@ HTTP handler 复用 SOCKS 的连接生命周期、连接数限制、DNS 解析�
 
 ---
 
-## 3. DNS 解析器（`internal/proxy/dns.go`）
+## 3. DNS 解析器（`proxy/dns.go`）
 
 ### 3.1 DNS 域名后缀
 
@@ -253,10 +253,10 @@ go-ocproxy 使用标准 `log` 包。所有日志行以方括号标签开头标�
 
 | 测试文件 | 覆盖 |
 |----------|------|
-| `internal/netstack/netstack_darwin_test.go` | S-IN-*, S-OUT-*, S-CH-1, isFatalWriteErr, writeOutboundWithRetry |
-| `internal/netstack/monitor_windows_test.go` | Windows UDP transport 与 Run 生命周期 |
-| `internal/transport/open_windows_test.go` | loopback/token 校验与双向 datagram |
-| `internal/proxy/proxy_test.go` | SOCKS5、HTTP、DNS、cache、限流与生命周期 |
+| `netstack/netstack_darwin_test.go` | S-IN-*, S-OUT-*, S-CH-1, isFatalWriteErr, writeOutboundWithRetry |
+| `netstack/monitor_windows_test.go` | Windows UDP transport 与 Run 生命周期 |
+| `transport/open_windows_test.go` | loopback/token 校验与双向 datagram |
+| `proxy/proxy_test.go` | SOCKS5、HTTP、DNS、cache、限流与生命周期 |
 
 ### 6.2 平台集成测试
 
