@@ -5,27 +5,27 @@
 
 ---
 
-## 1. stack — 网络栈 I/O（`internal/stack/stack.go`）
+## 1. netstack — 网络栈 I/O（`netstack/netstack.go`）
 
 ### 1.1 Inbound：VPN → gVisor
 
 | ID | 行为 | 验证方式 |
 |----|------|----------|
-| S-IN-1 | 每次 `input.Read()` 必须用 ≥65535 字节的 buffer 一次读取完整 datagram。禁止分多次读（如先读 header 再读 payload）。 | [TESTABLE] 构造 SOCK_DGRAM socketpair，写入完整 IP 包，验证 Read 端一次拿到全部字节 |
+| S-IN-1 | 每次 `tunnel.Read()` 必须用 ≥65535 字节的 buffer 一次读取完整 datagram。禁止分多次读（如先读 header 再读 payload）。 | [TESTABLE] 构造 SOCK_DGRAM socketpair，写入完整 IP 包，验证 Read 端一次拿到全部字节 |
 | S-IN-2 | 读到的字节数 < 20 时丢弃该包（不够 IPv4 header），不报错，继续读下一个。 | [TESTABLE] 写入 10 字节短包，验证不触发错误，后续正常包仍能处理 |
-| S-IN-3 | `input.Read()` 返回 error 时，`Run()` 立即返回该 error。 | [TESTABLE] 关闭 socketpair 写端，验证 Run 返回 io.EOF 或 os.ErrClosed |
-| S-IN-4 | 每个入向包必须拷贝到独立 `[]byte` 后再注入 gVisor，不能复用同一 buffer 指针。 | [TESTABLE] 连续写入两个不同内容的包，验证 gVisor 收到的两个包内容各自正确 |
+| S-IN-3 | `tunnel.Read()` 返回 error 时，`Run()` 立即返回该 error。 | [TESTABLE] 关闭 socketpair 写端，验证 Run 返回错误 |
+| S-IN-4 | 每个入向包通过 `buffer.MakeWithData` 一次拷贝到 gVisor 所有的存储；不得先 `bytes.Clone` 再二次拷贝。 | [TESTABLE] 连续写入两个不同内容的包，验证内容独立；benchmark 检查分配 |
 
 ### 1.2 Outbound：gVisor → VPN
 
 | ID | 行为 | 验证方式 |
 |----|------|----------|
 | S-OUT-1 | 出向 goroutine 遇到**致命写错误**（EPIPE / EBADF / ECONNRESET / ENOTCONN / io.ErrClosedPipe / os.ErrClosed）时退出，并**通知主循环**使 `Run()` 尽快返回。不能只退出 goroutine 而让 `Run()` 继续阻塞。 | [TESTABLE] 关闭 output fd，从 gVisor 发包触发致命错误，验证 Run() 在合理时间内（≤1s）返回 |
-| S-OUT-2 | 出向 goroutine 遇到**瞬时写错误**（ENOBUFS / EMSGSIZE / 其他非致命 errno）时，按指数退避（1ms→32ms 上限）**重试同一个包**最多 `outboundMaxRetries` 次，期间不丢包；重试全部失败才丢这一个包并继续处理下一个。**任何情况下都不能因瞬时错误退出 goroutine 或终止 `Run()`**——这是 v1.2 修复的核心：上一版直接退出，导致大文件上传后 SOCKS5 服务整体挂掉。 | [TESTABLE] mock Writer 序列 ENOBUFS×N 然后 nil，验证最终成功；持续 ENOBUFS 时验证 goroutine 不退出且 `Run()` 仍在跑 |
+| S-OUT-2 | 出向 goroutine 遇到**瞬时写错误**（ENOBUFS / EMSGSIZE / 其他非致命 errno）时，按指数退避（1ms→32ms 上限）**重试同一个包**最多 `outboundMaxRetries` 次，期间不丢包；重试全部失败才丢这一个包并继续处理下一个。**任何情况下都不能因瞬时错误退出 goroutine 或终止 `Run()`**——上一版直接退出会导致大文件上传后 SOCKS5 服务整体挂掉。 | [TESTABLE] mock Writer 序列 ENOBUFS×N 然后 nil，验证最终成功；持续 ENOBUFS 时验证 goroutine 不退出且 `Run()` 仍在跑 |
 | S-OUT-3 | 瞬时错误重试耗尽（即真的丢包）时，按秒聚合日志（每秒至多一行），关键字 `"outbound dropped"`，包含丢包计数和最近一个错误。**每包丢失不打日志**——避免抖动期刷屏。 | [TESTABLE] 检查 log 输出格式与频率 |
 | S-OUT-4 | 致命错误发生时，日志包含 `"outbound write fatal"` 关键字和具体错误信息。 | [TESTABLE] 检查 log 输出 |
 | S-OUT-5 | 出向 goroutine 必须使用 `net.Conn.Write`（而非 `*os.File.Write`）写 VPN fd。原因：`net.FileConn` dup fd 后会强制把它设为 `O_NONBLOCK`，dup 出的 fd 共享同一 file description，O_NONBLOCK 标志位也共享 → 原 `*os.File` 也变成非阻塞，裸 `Write` 在 buffer 满时直接返回 EAGAIN 而非由 Go runtime poller 自动等可写。`net.Conn.Write` 走 poller 会正确等可写，不会造成"上传卡死"。 | [MANUAL] 大文件（≥ 10MB）SOCKS5 上传不卡 1% |
-| S-OUT-6 | VPN fd 启动时显式调大 `SO_SNDBUF` / `SO_RCVBUF` 到 1 MiB（macOS 默认 AF_UNIX SOCK_DGRAM 仅约 8 KiB），降低高吞吐场景触发 ENOBUFS 的概率。设置必须在 `net.FileConn` **之前**对原始 fd 执行。 | [MANUAL] 启动日志或 SIGUSR1 stats 中观察 |
+| S-OUT-6 | transport 建立后通过 `net.UnixConn` / `net.UDPConn` 的 `SetWriteBuffer`、`SetReadBuffer` 将缓冲区请求值调到 1 MiB；不直接操作平台 fd/handle。 | [TESTABLE] mock buffer setter；两平台构建 |
 
 ### 1.3 isFatalWriteErr 判定表
 
@@ -53,9 +53,9 @@
 
 | ID | 行为 | 验证方式 |
 |----|------|----------|
-| S-HEALTH-1 | `Run()` 启动后，每隔 **1 秒** 向 output fd 发送一个 **0 字节** 的 write 探测 VPN 是否存活（与原版 `cb_housekeeping` 行为一致）。 | [TESTABLE] 用 socketpair 的读端检查是否每秒收到 0 字节 datagram |
-| S-HEALTH-2 | 如果 0 字节 write 返回 ECONNREFUSED 或 ENOTCONN，判定 VPN 已死亡，`Run()` 返回错误。 | [TESTABLE] 关闭 socketpair 对端后等待，验证 Run() 在 ≤2s 内返回 |
-| S-HEALTH-3 | 如果 0 字节 write 返回其他瞬时错误（如 ENOBUFS），忽略，不判定为死亡。 | [TESTABLE] mock Writer 返回 ENOBUFS，验证 Run 继续运行 |
+| S-HEALTH-1 | macOS 每隔 **1 秒**用 `getpeername` 检查 AF_UNIX datagram peer，不发送探测数据。 | [TESTABLE] socketpair 关闭 peer 后检查返回 |
+| S-HEALTH-2 | macOS 收到 ENOTCONN / ECONNRESET / ECONNREFUSED / EBADF 时判定 transport 死亡，`Run()` 返回错误。 | [TESTABLE] 关闭 socketpair 对端后等待，验证 Run() 在 ≤2s 内返回 |
+| S-HEALTH-3 | Windows connected UDP 不伪造 socket 存活检测；helper 与 go-ocproxy 必须互相监督进程生命周期。 | [TESTABLE] Windows UDP Run 测试；消费方 helper 集成测试 |
 | S-HEALTH-4 | 健康检查日志：VPN 死亡时输出包含 `"vpn health check failed"` 的日志。 | [TESTABLE] 检查 log 输出 |
 
 ### 1.6 per-packet 内存优化
@@ -68,7 +68,7 @@
 
 ---
 
-## 2. socks — SOCKS5 + HTTP 代理服务器（`socks/socks.go`、`socks/http.go`）
+## 2. proxy — SOCKS5 + HTTP 代理服务器（`proxy/socks5.go`、`proxy/http.go`）
 
 监听端口同时承载 SOCKS5 和 HTTP 代理，靠首字节嗅探分流（见 SK-SNIFF-1）。
 
@@ -94,7 +94,7 @@
 | ID | 行为 | 验证方式 |
 |----|------|----------|
 | SK-IP-1 | `resolve()` 优先返回 IPv4（A 记录）。当栈有 IPv6 且 A 查询无结果时，回退到 AAAA 记录。不配置 IPv6 时，只查 A 记录。 | [TESTABLE] 验证优先返回 IPv4；栈有 IPv6 时能返回 AAAA 结果 |
-| SK-IP-2 | `net.LookupIP` fallback 路径优先选择 IPv4 地址。遍历结果列表，取第一个 `.To4() != nil` 的地址；无 IPv4 且栈有 IPv6 时选 IPv6。 | [TESTABLE] mock resolver 返回 `[::1, 1.2.3.4]`，验证选中 `1.2.3.4` |
+| SK-IP-2 | 系统 resolver fallback 必须调用可取消的 `net.DefaultResolver.LookupNetIP(ctx, ...)` 并优先选 IPv4；无 IPv4 且栈有 IPv6 时选 IPv6。 | [TESTABLE] 取消 context，验证解析及时停止；验证 IPv4 优先 |
 
 ### 2.4 连接生命周期
 
@@ -108,7 +108,7 @@
 
 | ID | 行为 | 验证方式 |
 |----|------|----------|
-| SK-LIMIT-1 | 活跃连接数上限 **1024**（可通过参数配置）。达到上限时，新连接仍然 Accept 但立即回复 `REP=0x01`（General SOCKS server failure）并关闭，日志记录 `"max connections reached"`。 | [TESTABLE] 建立 1024 个连接后再建一个，验证第 1025 个收到 REP=0x01 |
+| SK-LIMIT-1 | 活跃连接数上限 **1024**。达到上限时，在协议嗅探前立即关闭新连接并记录 `"max connections reached"`；此时协议尚未知，不能伪造 SOCKS5 回复。 | [TESTABLE] 填满限流槽后建立新连接，验证立即关闭 |
 | SK-LIMIT-2 | 连接关闭后计数器递减，后续新连接可以正常接入。 | [TESTABLE] 关闭一个连接后建新连接，验证成功 |
 
 ### 2.6 统计与可观测性
@@ -118,7 +118,7 @@
 | SK-STATS-1 | 维护以下计数器：活跃连接数、历史最大连接数、总连接数、总传输字节数（in/out）、DNS cache 命中数 / 未命中数。 | [TESTABLE] 建立并关闭若干连接后，检查计数器值 |
 | SK-STATS-2 | 收到 SIGUSR1 信号时，输出当前统计到日志。格式至少包含：`"connections: active=%d max=%d total=%d dns_cache_hit=%d miss=%d"` | [TESTABLE] 发送 SIGUSR1，检查 log 输出 |
 
-### 2.7 HTTP 代理协议（`socks/http.go`）
+### 2.7 HTTP 代理协议（`proxy/http.go`）
 
 HTTP handler 复用 SOCKS 的连接生命周期、连接数限制、DNS 解析与统计逻辑。
 
@@ -137,7 +137,7 @@ HTTP handler 复用 SOCKS 的连接生命周期、连接数限制、DNS 解析�
 
 ---
 
-## 3. DNS 解析器（`internal/socks/socks.go` DNS 部分）
+## 3. DNS 解析器（`proxy/dns.go`）
 
 ### 3.1 DNS 域名后缀
 
@@ -203,7 +203,7 @@ HTTP handler 复用 SOCKS 的连接生命周期、连接数限制、DNS 解析�
 go-ocproxy 使用标准 `log` 包。所有日志行以方括号标签开头标识模块：
 
 ```
-[stack]   — 网络栈 I/O
+[netstack] — 网络栈 I/O
 [socks]   — SOCKS5 协议处理
 [dns]     — DNS 解析
 [main]    — 进程生命周期
@@ -220,8 +220,8 @@ go-ocproxy 使用标准 `log` 包。所有日志行以方括号标签开头标�
 | SOCKS 握手失败 | 客户端地址、失败原因（版本错误 / 不支持的命令 / 不支持的地址类型 / 超时） | [socks] |
 | DNS 解析成功 | 域名 → IP，TTL，来源（cache hit / UDP / TCP fallback） | [dns] |
 | DNS 解析失败 | 域名、尝试的服务器、错误原因 | [dns] |
-| 出向包写失败（瞬时） | 错误类型、丢弃包计数 | [stack] |
-| 出向包写失败（致命） | 错误类型 | [stack] |
+| 出向包写失败（瞬时） | 错误类型、丢弃包计数 | [netstack] |
+| 出向包写失败（致命） | 错误类型 | [netstack] |
 | VPN 健康检查失败 | 错误类型 | [health] |
 | 连接数达上限 | 当前连接数 | [socks] |
 | SIGUSR1 统计 | 连接数、最大连接数、DNS cache 大小 / 命中率 | [main] |
@@ -238,27 +238,31 @@ go-ocproxy 使用标准 `log` 包。所有日志行以方括号标签开头标�
 
 ## 6. 测试覆盖矩阵
 
+### 6.0 Windows 平台适配
+
+| ID | 行为 | 验证方式 |
+|----|------|----------|
+| WIN-FD-1 | Windows transport 使用 `net.UDPConn` 的跨平台方法，不直接把 socket handle 当 Unix fd 调用 `syscall`。 | [TESTABLE] Windows native test + build |
+| WIN-FD-2 | `VPNFD` 缺失但设置 `VPN_UDP_PEER=127.0.0.1:<port>` 时，进程必须建立 connected UDP transport，把 `VPN_UDP_TOKEN` 原样作为首个 datagram 发送，并继续按“一 datagram 一 IP 包”语义运行。该通道只接受 loopback + 非零端口，可供 Windows libopenconnect `openconnect_setup_tun_fd(HANDLE)` 的外部 helper 接入；不得回退到会破坏包边界的 stdin/stdout 字节流。 | [TESTABLE] 本机 UDP listener 校验 token、双向 datagram 边界和非 loopback 拒绝行为 |
+| WIN-FD-3 | 使用 `VPN_UDP_PEER` 时必须同时设置随机 `VPN_UDP_TOKEN`，供 helper 精确校验并防止其他本机进程抢先注入。token 最长 128 字节；缺失或超限必须拒绝启动。 | [TESTABLE] 覆盖缺失、有效和超长 token |
+| WIN-SIG-1 | Windows 上 Ctrl+C / Interrupt / SIGTERM 触发优雅关闭；Windows 没有 SIGUSR1，因此不提供信号触发的 stats dump。 | [MANUAL] 启动后发送控制台中断，验证进程退出 |
+| WIN-BUILD-1 | `GOOS=windows GOARCH=amd64 go build` 必须成功，产出可由外部 libopenconnect helper 通过 `VPN_UDP_PEER` 启动的 PE32+ 可执行文件。 | [TESTABLE] Windows CI/native build |
+| WIN-LIFE-1 | connected UDP 的 `getpeername` 只能验证 peer 已配置，不能可靠判断 helper 进程仍存活；Windows helper 必须把 go-ocproxy 纳入自身生命周期管理，helper 或父进程退出时同步终止 go-ocproxy。 | [MANUAL] 终止 helper/父进程，确认 go-ocproxy 被回收 |
+
 ### 6.1 单元测试（不需要真实 openconnect）
 
 | 测试文件 | 覆盖 |
 |----------|------|
-| `stack/stack_test.go` | S-IN-*, S-OUT-*, S-CH-1, isFatalWriteErr 判定表, writeOutboundWithRetry（W-RETRY-1..7） |
-| `socks/socks_test.go` | SK-SNIFF-1, SK-PROTO-*, SK-IP-*, DNS-SUFFIX-*, DNS-CACHE-* |
-| `socks/socks_test.go` | buildDNSQuery / parseDNSResponse / skipDNSName 边界 |
-| `socks/socks_test.go` | HT-CONNECT-2/4, HT-FORWARD-1/2/4, HT-ERR-1（`Test*HTTP*` 系列） |
+| `netstack/netstack_darwin_test.go` | S-IN-*, S-OUT-*, S-CH-1, isFatalWriteErr, writeOutboundWithRetry |
+| `netstack/monitor_windows_test.go` | Windows UDP transport 与 Run 生命周期 |
+| `transport/open_windows_test.go` | loopback/token 校验与双向 datagram |
+| `proxy/proxy_test.go` | SOCKS5、HTTP、DNS、cache、限流与生命周期 |
 
-### 6.2 集成测试（需要 socketpair 或 mock VPN fd）
+### 6.2 平台集成测试
 
-| 测试文件 | 覆盖 |
-|----------|------|
-| `stack/integration_test.go` | S-HEALTH-*, S-OUT-1 主循环通知 |
-| `socks/integration_test.go` | SK-TIMEOUT-*, SK-LIMIT-*, SK-LIFE-* |
-
-### 6.3 端到端测试（需要真实 openconnect 或 mock 脚本）
-
-| 测试文件 | 覆盖 |
-|----------|------|
-| `e2e_test.go` | M-START-*, M-SIG-* |
+平台集成测试与单元测试放在同一包中，通过 `_darwin_test.go` / `_windows_test.go`
+文件名选择目标系统；CI 在 macOS 与 Windows 原生执行测试，并交叉构建 macOS arm64 / Windows amd64 发布目标。真实 OpenConnect
+链路仍需发布前手工 smoke test。
 
 ---
 
@@ -274,6 +278,7 @@ go-ocproxy 使用标准 `log` 包。所有日志行以方括号标签开头标�
 | 远程访问 `-g` | 支持 | 不支持（硬编码 127.0.0.1） | 安全考虑，不暴露到非本机 |
 | vpnns 命名空间隔离 | 支持（Linux） | 不支持 | 目标平台 macOS，无 Linux namespace |
 | tcpdump `-T` | 支持 | 不支持 | 暂不需要 |
-| 出站写阻塞策略 | C `write()` + `select`/`poll` 显式等可写 | `net.Conn.Write` 走 Go runtime poller，ENOBUFS 由 `writeOutboundWithRetry` 退避重试 | Go 语言惯用法；同时绕开 `net.FileConn` 把 dup fd 设 `O_NONBLOCK` 影响共享 file description 的隐性问题（详见 `CLAUDE.md` 的"非阻塞 fd 陷阱"） |
+| 出站写阻塞策略 | C `write()` + `select`/`poll` 显式等可写 | `net.Conn.Write` 走 Go runtime poller，ENOBUFS 由 `writeOutboundWithRetry` 退避重试 | Go 语言惯用法；同时绕开 `net.FileConn` 把 dup fd 设 `O_NONBLOCK` 影响共享 file description 的隐性问题（详见 `AGENTS.md` 的"非阻塞 fd 陷阱"） |
+| Windows 统计信号 | N/A | 不支持 SIGUSR1；保留正常日志和退出控制信号 | Windows 控制台没有 POSIX SIGUSR1 |
 
 如有新的有意差异，必须更新此表。

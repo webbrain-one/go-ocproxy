@@ -1,4 +1,4 @@
-package stack
+package netstack
 
 import (
 	"context"
@@ -86,9 +86,9 @@ func TestIsFatalWriteErr(t *testing.T) {
 	}
 }
 
-func TestNewNetStack(t *testing.T) {
+func TestNew(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
-		ns, err := NewNetStack("10.0.0.1", 1500, "")
+		ns, err := New("10.0.0.1", 1500, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -97,19 +97,19 @@ func TestNewNetStack(t *testing.T) {
 		}
 	})
 	t.Run("invalid_IP", func(t *testing.T) {
-		_, err := NewNetStack("not-an-ip", 1500, "")
+		_, err := New("not-an-ip", 1500, "")
 		if err == nil {
 			t.Fatal("expected error for invalid IP")
 		}
 	})
 	t.Run("empty_IP", func(t *testing.T) {
-		_, err := NewNetStack("", 1500, "")
+		_, err := New("", 1500, "")
 		if err == nil {
 			t.Fatal("expected error for empty IP")
 		}
 	})
 	t.Run("valid_dualstack", func(t *testing.T) {
-		ns, err := NewNetStack("10.0.0.1", 1500, "fd00::1")
+		ns, err := New("10.0.0.1", 1500, "fd00::1")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -118,7 +118,7 @@ func TestNewNetStack(t *testing.T) {
 		}
 	})
 	t.Run("ipv4_only", func(t *testing.T) {
-		ns, err := NewNetStack("10.0.0.1", 1500, "")
+		ns, err := New("10.0.0.1", 1500, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -127,26 +127,39 @@ func TestNewNetStack(t *testing.T) {
 		}
 	})
 	t.Run("invalid_ipv6", func(t *testing.T) {
-		_, err := NewNetStack("10.0.0.1", 1500, "not-an-ip")
+		_, err := New("10.0.0.1", 1500, "not-an-ip")
 		if err == nil {
 			t.Fatal("expected error for invalid IPv6")
 		}
 	})
 	t.Run("v4_as_v6_rejected", func(t *testing.T) {
-		_, err := NewNetStack("10.0.0.1", 1500, "192.168.1.1")
+		_, err := New("10.0.0.1", 1500, "192.168.1.1")
 		if err == nil {
 			t.Fatal("expected error for IPv4 address passed as IPv6")
 		}
 	})
 }
 
-func socketpair(t *testing.T) (vpnSide *os.File, appSide *os.File) {
+func socketpair(t *testing.T) (vpnSide net.Conn, appSide net.Conn) {
 	t.Helper()
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_DGRAM, 0)
 	if err != nil {
 		t.Fatalf("socketpair: %v", err)
 	}
-	return os.NewFile(uintptr(fds[0]), "vpn"), os.NewFile(uintptr(fds[1]), "app")
+	vpnFile := os.NewFile(uintptr(fds[0]), "vpn")
+	appFile := os.NewFile(uintptr(fds[1]), "app")
+	defer vpnFile.Close()
+	defer appFile.Close()
+	vpnSide, err = net.FileConn(vpnFile)
+	if err != nil {
+		t.Fatalf("wrap vpn socket: %v", err)
+	}
+	appSide, err = net.FileConn(appFile)
+	if err != nil {
+		vpnSide.Close()
+		t.Fatalf("wrap app socket: %v", err)
+	}
+	return vpnSide, appSide
 }
 
 func makeIPv4Packet(totalLen int, src, dst [4]byte) []byte {
@@ -178,9 +191,9 @@ func makeIPv6Packet(payloadLen int, src, dst [16]byte) []byte {
 
 // S-IN-1/2/4: one-shot datagram read, short packet discard
 func TestRunInboundDatagram(t *testing.T) {
-	ns, err := NewNetStack("10.0.0.1", 1500, "")
+	ns, err := New("10.0.0.1", 1500, "")
 	if err != nil {
-		t.Fatalf("NewNetStack: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	vpn, app := socketpair(t)
 	defer vpn.Close()
@@ -189,7 +202,7 @@ func TestRunInboundDatagram(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- ns.Run(ctx, app, app) }()
+	go func() { errCh <- ns.Run(ctx, app) }()
 
 	pkt := makeIPv4Packet(40, [4]byte{10, 0, 0, 2}, [4]byte{10, 0, 0, 1})
 	vpn.Write(pkt)
@@ -217,9 +230,9 @@ func TestRunInboundDatagram(t *testing.T) {
 }
 
 func TestRunInboundIPv6(t *testing.T) {
-	ns, err := NewNetStack("10.0.0.1", 1500, "fd00::1")
+	ns, err := New("10.0.0.1", 1500, "fd00::1")
 	if err != nil {
-		t.Fatalf("NewNetStack: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	vpn, app := socketpair(t)
 	defer vpn.Close()
@@ -228,7 +241,7 @@ func TestRunInboundIPv6(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- ns.Run(ctx, app, app) }()
+	go func() { errCh <- ns.Run(ctx, app) }()
 
 	src := [16]byte{0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
 	dst := [16]byte{0xfd, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
@@ -250,15 +263,15 @@ func TestRunInboundIPv6(t *testing.T) {
 
 // S-HEALTH-2: health check detects dead VPN via write probe
 func TestRunHealthCheckDetectsDeadVPN(t *testing.T) {
-	ns, err := NewNetStack("10.0.0.1", 1500, "")
+	ns, err := New("10.0.0.1", 1500, "")
 	if err != nil {
-		t.Fatalf("NewNetStack: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	vpn, app := socketpair(t)
 	defer app.Close()
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- ns.Run(context.Background(), app, app) }()
+	go func() { errCh <- ns.Run(context.Background(), app) }()
 
 	time.Sleep(200 * time.Millisecond)
 
@@ -273,50 +286,6 @@ func TestRunHealthCheckDetectsDeadVPN(t *testing.T) {
 		t.Logf("VPN death detected: %v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not detect VPN death within 5s")
-	}
-}
-
-// S-OUT-1: outbound fatal error propagates to main loop
-func TestRunOutboundFatalNotifiesMainLoop(t *testing.T) {
-	ns, err := NewNetStack("10.0.0.1", 1500, "")
-	if err != nil {
-		t.Fatalf("NewNetStack: %v", err)
-	}
-
-	// separate socketpairs: input stays alive, output peer gets closed
-	vpnIn, appIn := socketpair(t)
-	vpnOut, appOut := socketpair(t)
-	defer vpnIn.Close()
-	defer appIn.Close()
-	defer appOut.Close()
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- ns.Run(context.Background(), appIn, appOut) }()
-
-	// inject traffic so gVisor produces outbound packets
-	pkt := makeIPv4Packet(40, [4]byte{10, 0, 0, 2}, [4]byte{10, 0, 0, 1})
-	vpnIn.Write(pkt)
-	time.Sleep(100 * time.Millisecond)
-
-	// close output peer → outbound writes fail with EPIPE
-	vpnOut.Close()
-
-	// keep injecting so gVisor keeps producing outbound traffic
-	go func() {
-		for range 50 {
-			vpnIn.Write(pkt)
-			time.Sleep(20 * time.Millisecond)
-		}
-	}()
-
-	select {
-	case err := <-errCh:
-		if err == nil {
-			t.Fatal("expected error")
-		}
-		t.Logf("Run returned: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return within 5s")
 	}
 }
 
@@ -446,9 +415,9 @@ func TestWriteOutboundWithRetry_ZeroRetries(t *testing.T) {
 
 // context cancel makes Run return immediately
 func TestRunContextCancel(t *testing.T) {
-	ns, err := NewNetStack("10.0.0.1", 1500, "")
+	ns, err := New("10.0.0.1", 1500, "")
 	if err != nil {
-		t.Fatalf("NewNetStack: %v", err)
+		t.Fatalf("New: %v", err)
 	}
 	vpn, app := socketpair(t)
 	defer vpn.Close()
@@ -456,7 +425,7 @@ func TestRunContextCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- ns.Run(ctx, app, app) }()
+	go func() { errCh <- ns.Run(ctx, app) }()
 
 	time.Sleep(200 * time.Millisecond)
 	cancel()

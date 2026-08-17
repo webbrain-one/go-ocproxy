@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target_os: darwin
+            target_arch: arm64
+            binary: go-ocproxy-ci
+          - os: windows-latest
+            target_os: windows
+            target_arch: amd64
+            binary: go-ocproxy-ci.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          cache: true
+      - name: Test
+        run: go test ./...
+      - name: Race test
+        if: runner.os == 'macOS'
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build release target
+        env:
+          GOOS: ${{ matrix.target_os }}
+          GOARCH: ${{ matrix.target_arch }}
+          CGO_ENABLED: 0
+        run: go build -trimpath -o ${{ matrix.binary }} .

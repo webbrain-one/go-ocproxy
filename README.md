@@ -27,7 +27,7 @@ The original `ocproxy` is written in C and carries roughly 80,000 lines of code,
 - [x] **Packet Boundary Logic**: Robust handling of IP packet streams for stable long-lived connections.
 
 ## 🛠️ Build
-Requires Go 1.25+.
+Requires the latest stable Go release (currently Go 1.26.5).
 ```bash
 cd go-ocproxy
 go build -o go-ocproxy
@@ -44,6 +44,12 @@ sudo openconnect \
 
 The listening port accepts both SOCKS5 and HTTP proxy connections. In your browser/system proxy settings, point HTTP, HTTPS, and SOCKS all at `127.0.0.1:1080`.
 
+On Windows, OpenConnect does not expose `--script-tun`. An external libopenconnect
+helper can start go-ocproxy with a connected loopback UDP transport in
+`VPN_UDP_PEER=127.0.0.1:<port>`. The transport preserves one IP packet per datagram;
+non-loopback peers are rejected. Helpers must also set a random `VPN_UDP_TOKEN`
+and validate that exact token as the initial datagram before accepting packets.
+
 ### CLI Arguments
 | Argument | Description | Default |
 | :--- | :--- | :--- |
@@ -58,7 +64,7 @@ The listening port accepts both SOCKS5 and HTTP proxy connections. In your brows
 ## 📚 For Developers / Contributors
 
 - **Behavior contract & test matrix**: [SPEC.md](SPEC.md)
-- **Architecture, gotchas, contribution guide**: [CLAUDE.md](CLAUDE.md) — read this **before changing fd / netstack code**
+- **Architecture, gotchas, contribution guide**: [AGENTS.md](AGENTS.md) — read this **before changing fd / netstack code**
 - **Version history**: [docs/CHANGELOG.md](docs/CHANGELOG.md)
 
 ---

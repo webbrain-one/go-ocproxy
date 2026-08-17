@@ -25,7 +25,7 @@
 - [x] **稳定流处理**：精确的 IP 数据包边界处理，确保长连接稳定性。
 
 ## 🛠️ 编译
-需要 Go 1.25 或更高版本。
+需要最新稳定版 Go（当前为 Go 1.26.5）。
 ```bash
 cd go-ocproxy
 go build -o go-ocproxy
@@ -45,11 +45,17 @@ sudo openconnect \
 - HTTPS 代理：`127.0.0.1:1080`
 - SOCKS 代理：`127.0.0.1:1080`
 
+Windows 上的 OpenConnect 不提供 `--script-tun`。外部 libopenconnect helper 可通过
+`VPN_UDP_PEER=127.0.0.1:<port>` 启动 go-ocproxy，使用 connected loopback UDP
+保持“一 datagram 一 IP 包”的边界；非 loopback 地址会被拒绝。helper 必须同时设置随机
+`VPN_UDP_TOKEN`，并在收包前校验首个 datagram 与该 token 完全一致。
+
 ### 命令行参数
 | 参数 | 说明 | 默认值 |
 | :--- | :--- | :--- |
 | `-D` | SOCKS5/HTTP 代理监听端口（同端口嗅探） | `1080` |
 | `-ip` | 手动指定内部 IPv4 地址（通常自动获取） | 无 |
+| `-ip6` | 手动指定可选的内部 IPv6 地址 | 无 |
 | `-mtu` | 手动指定 MTU 大小（通常自动获取） | `1500` |
 | `-o` | DNS 默认域名后缀（覆盖 `CISCO_DEF_DOMAIN`） | 无 |
 | `-k` | TCP keepalive 间隔（秒），0 关闭 | `0` |
@@ -58,7 +64,7 @@ sudo openconnect \
 ## 📚 给开发者 / 贡献者
 
 - **行为契约和测试矩阵**：[SPEC.md](SPEC.md)
-- **架构、踩坑笔记、贡献指南**：[CLAUDE.md](CLAUDE.md) —— 改 fd / 网络栈代码**之前必读**
+- **架构、踩坑笔记、贡献指南**：[AGENTS.md](AGENTS.md) —— 改 fd / 网络栈代码**之前必读**
 - **版本变更记录**：[docs/CHANGELOG.md](docs/CHANGELOG.md)
 
 ---
